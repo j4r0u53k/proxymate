@@ -1,0 +1,18 @@
+[package]
+name = "proxymate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Jaroslav Beran <jara.beran@gmail.com>"]
+
+[dependencies]
+async-std = "1.0"
+async-tls = "0.11.0"
+async-tungstenite = "0.16"
+ws_stream_tungstenite = "0.7.0"
+futures = "0.3.21"
+structopt = "0.3.26"
+rustls-pemfile = "0.3.0"
+rustls = "0.19.0"
+log = "0.4.14"
+env_logger ="0.9.0"
