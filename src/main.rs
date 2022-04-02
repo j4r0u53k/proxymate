@@ -15,16 +15,16 @@ use log::*;
 
 #[derive(Debug, StructOpt)]
 struct CliOptions {
-    #[structopt(long, help = "Use WebSockets for server")]
+    #[structopt(long, help = "Use WebSockets for the server")]
     server_ws: bool,
 
-    #[structopt(long, help = "Use TLS for server")]
+    #[structopt(long, help = "Use TLS for the server")]
     server_tls: bool,
 
-    #[structopt(short = "k", long, help = "Private key file in PEM format")]
+    #[structopt(short = "k", long, help = "Server private key file in PEM format")]
     server_key: Option<PathBuf>,
 
-    #[structopt(short = "c", long, help = "Certificates file in PEM format")]
+    #[structopt(short = "c", long, help = "Server certificates file(s) in PEM format")]
     server_certs: Option<Vec<PathBuf>>,
 
     #[structopt(long, help = "CA Certificates file in PEM format")]
