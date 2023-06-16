@@ -7,10 +7,10 @@ use async_std::task;
 use async_std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use async_std::io::ErrorKind;
 use async_std::path::{Path, PathBuf};
-use futures::{FutureExt, pin_mut, AsyncReadExt, AsyncRead, AsyncWrite, StreamExt};
+use futures::{AsyncReadExt, AsyncRead, AsyncWrite, StreamExt};
 use structopt::StructOpt;
 use rustls_pemfile;
-use rustls::{Certificate, NoClientAuth, PrivateKey, ServerConfig, ClientConfig};
+use rustls::{Certificate, PrivateKey, ServerConfig, ClientConfig};
 use log::*;
 
 #[derive(Debug, StructOpt)]
@@ -116,29 +116,35 @@ fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Err
 
     info!("Loaded {} certificates, {} keys", certs.len(), keys.len());
 
-    let mut config = ServerConfig::new(NoClientAuth::new());
-    config.set_single_cert(certs,
-                           keys.first()
-                               .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid private key"))?
-                               .clone())
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, keys.first()
+                          .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid private key"))?
+                          .clone())
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
 
     Ok(config)
 }
 
 fn load_client_config(options: &CliOptions) -> Result<ClientConfig, std::io::Error> {
-    let mut config = ClientConfig::new();
-    config.enable_sni = false;
-
+    let mut root_cert_store = rustls::RootCertStore::empty();
     if let Some(ca_certs) = &options.ca_certs {
-        let (added, _) = config.root_store
-            .add_pem_file(&mut BufReader::new(File::open(ca_certs)?))
+        let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(ca_certs)?))
             .or_else(|_| {
                 error!("Can't add root certificate");
                 Err(std::io::Error::from(ErrorKind::InvalidInput))
             })?;
-        info!("Added {} CA certificates", added);
-    }
+        let (added, ignored) = root_cert_store.add_parsable_certificates(&certs);
+        info!("CA certificates added: {}, ignored: {}", added, ignored);
+    };
+
+    let mut config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
+
+    config.enable_sni = false;
 
     Ok(config)
 }
@@ -263,11 +269,10 @@ async fn do_transfer(stream_a: AsyncRWBox, stream_b: AsyncRWBox) {
     let (mut reader_a, mut writer_a) = stream_a.split();
     let (mut reader_b, mut writer_b) = stream_b.split();
 
-    let a_to_b = async_std::io::copy(&mut reader_a, &mut writer_b).fuse();
-    let b_to_a = async_std::io::copy(&mut reader_b, &mut writer_a).fuse();
-
-    pin_mut!(a_to_b, b_to_a);
-    futures::future::select(a_to_b, b_to_a).await;
+    futures::future::select(
+        std::pin::pin!(async_std::io::copy(&mut reader_a, &mut writer_b)),
+        std::pin::pin!(async_std::io::copy(&mut reader_b, &mut writer_a))
+        ).await;
 }
 
 const PROGRAM_NAME: &'static str = env!("CARGO_PKG_NAME");
