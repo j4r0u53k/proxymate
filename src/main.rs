@@ -127,6 +127,35 @@ fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Err
     Ok(config)
 }
 
+fn load_server_options(cli_options: &CliOptions) -> Result<ServerOptions, std::io::Error> {
+    Ok(ServerOptions {
+        tls_config: if cli_options.server_tls {
+            Some(load_server_config(&cli_options)?)
+        } else {
+            None
+        },
+        ws: cli_options.server_ws
+    })
+}
+
+fn load_target_options(cli_options: &CliOptions) -> Result<TargetOptions<String>, std::io::Error> {
+    let target_domain = cli_options.target_addr.split(':').nth(0)
+        .ok_or_else(|| {
+            error!("Invalid target address format");
+            std::io::Error::from(std::io::ErrorKind::InvalidInput)})?;
+
+    Ok(TargetOptions {
+        address: cli_options.target_addr.clone(),
+        domain: target_domain.to_string(),
+        tls_config: if cli_options.target_tls {
+            Some(load_client_config(&cli_options)?)
+        } else {
+            None
+        },
+        ws: cli_options.target_ws
+    })
+}
+
 fn load_client_config(options: &CliOptions) -> Result<ClientConfig, std::io::Error> {
     let mut root_cert_store = rustls::RootCertStore::empty();
     if let Some(ca_certs) = &options.ca_certs {
@@ -169,7 +198,7 @@ async fn server_handshake(stream: TcpStream, options: Arc<ServerOptions>, timeou
         Box::new(stream)
     };
 
-    let stream = if options.ws {
+    if options.ws {
         info!("Establishing WebSockets server handshake with client {} ...", &peer_addr);
 
         let ws_stream = async_std::io::timeout(*timeout, async {
@@ -183,13 +212,11 @@ async fn server_handshake(stream: TcpStream, options: Arc<ServerOptions>, timeou
         })?;
 
         info!("WebSockets server handshake with client {} complete", &peer_addr);
-        Box::new(ws_stream_tungstenite::WsStream::new(ws_stream))
+        Ok(Box::new(ws_stream_tungstenite::WsStream::new(ws_stream)))
     }
     else {
-        stream
-    };
-
-    Ok(stream)
+        Ok(stream)
+    }
 }
 
 fn ws_request_url<T: Display>(addr: &T, is_tls: bool) -> String {
@@ -227,7 +254,7 @@ async fn target_handshake<T, U>(options: Arc<TargetOptions<T>>, client_addr: &U,
         Box::new(target_stream)
     };
 
-    let target_stream = if options.ws {
+    if options.ws {
         let (ws_stream, _) = async_std::io::timeout(*timeout, async {
             async_tungstenite::client_async(ws_request_url(&target_addr.to_string(), options.tls_config.is_some()), target_stream).await
                 .map_err(|err| {
@@ -239,24 +266,22 @@ async fn target_handshake<T, U>(options: Arc<TargetOptions<T>>, client_addr: &U,
         })?;
 
         info!("{} WebSockets handshake with the target established", client_addr);
-        Box::new(ws_stream_tungstenite::WsStream::new(ws_stream))
+        Ok(Box::new(ws_stream_tungstenite::WsStream::new(ws_stream)))
     } else {
-        target_stream
-    };
-
-    Ok(target_stream)
+        Ok(target_stream)
+    }
 }
 
 async fn handle_connection<T>(front_stream: TcpStream,
                               server_options: Arc<ServerOptions>,
                               target_options: Arc<TargetOptions<T>>,
-                              handshake_timeout: &Duration) -> Result<(), std::io::Error>
+                              handshake_timeout: Duration) -> Result<(), std::io::Error>
     where T:  ToSocketAddrs + Display
 {
     let client_addr = front_stream.peer_addr()?;
 
-    let front_stream = server_handshake(front_stream, server_options, handshake_timeout).await?;
-    let target_stream = target_handshake(target_options.clone(), &client_addr, handshake_timeout).await?;
+    let front_stream = server_handshake(front_stream, server_options, &handshake_timeout).await?;
+    let target_stream = target_handshake(target_options.clone(), &client_addr, &handshake_timeout).await?;
 
     info!("{} Connection to the target established", &client_addr);
     do_transfer(front_stream, target_stream).await;
@@ -275,6 +300,35 @@ async fn do_transfer(stream_a: AsyncRWBox, stream_b: AsyncRWBox) {
         ).await;
 }
 
+async fn run_proxy(listen_addr: String,
+                    server_options: Arc<ServerOptions>,
+                    target_options: Arc<TargetOptions<String>>,
+                    handshake_timeout: Duration) -> std::io::Result<()> {
+    let listener = TcpListener::bind(listen_addr).await?;
+    let mut incoming = listener.incoming();
+
+    info!("Server listening at {}", listener.local_addr()?);
+
+    while let Some(stream) = incoming.next().await {
+        let stream = stream?;
+
+        let server_options = server_options.clone();
+        let target_options = target_options.clone();
+
+        task::spawn(async move {
+            let peer_addr = stream.peer_addr().unwrap();
+            info!("New connection from {}", &peer_addr);
+
+            if let Err(err) = handle_connection(stream, server_options, target_options, handshake_timeout).await {
+                error!("{} Error handling connection: {}", &peer_addr, err);
+            }
+            info!("{} Client disconnected", &peer_addr);
+        });
+    }
+
+    Ok(())
+}
+
 const PROGRAM_NAME: &'static str = env!("CARGO_PKG_NAME");
 const PROGRAM_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
@@ -290,56 +344,9 @@ fn main() -> std::io::Result<()> {
     let options: CliOptions = CliOptions::from_args();
     info!("Run with options: {:?}", options);
 
-    let server_options = Arc::new(ServerOptions {
-        tls_config: if options.server_tls {
-            Some(load_server_config(&options)?)
-        } else {
-            None
-        },
-        ws: options.server_ws
-    });
-
-    let target_domain = options.target_addr.split(':').nth(0)
-        .ok_or_else(|| {
-            error!("Invalid target address format");
-            std::io::Error::from(std::io::ErrorKind::InvalidInput)})?;
-
-    let target_options = Arc::new(TargetOptions {
-        address: options.target_addr.clone(),
-        domain: target_domain.to_string(),
-        tls_config: if options.target_tls {
-            Some(load_client_config(&options)?)
-        } else {
-            None
-        },
-        ws: options.target_ws
-    });
-
+    let server_options = Arc::new(load_server_options(&options)?);
+    let target_options = Arc::new(load_target_options(&options)?);
     let handshake_timeout = Duration::from_secs(options.handshake_timeout as u64);
 
-    task::block_on(async {
-        let listener = TcpListener::bind(options.listen_addr).await?;
-        let mut incoming = listener.incoming();
-
-        info!("Server listening at {}", listener.local_addr()?);
-
-        while let Some(stream) = incoming.next().await {
-            let stream = stream?;
-
-            let server_options = server_options.clone();
-            let target_options = target_options.clone();
-
-            task::spawn(async move {
-                let peer_addr = stream.peer_addr().unwrap();
-                info!("New connection from {}", &peer_addr);
-
-                if let Err(err) = handle_connection(stream, server_options, target_options, &handshake_timeout).await {
-                    error!("{} Error handling connection: {}", &peer_addr, err);
-                }
-                info!("{} Client disconnected", &peer_addr);
-            });
-        }
-
-        Ok(())
-    })
+    task::block_on(run_proxy(options.listen_addr, server_options, target_options, handshake_timeout))
 }
