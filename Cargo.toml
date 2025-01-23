@@ -1,18 +1,18 @@
 [package]
 name = "proxymate"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["Jaroslav Beran <jara.beran@gmail.com>"]
 
 [dependencies]
-async-std = "1.12.0"
-async-tls = "0.12.0"
-async-tungstenite = "0.22"
-ws_stream_tungstenite = "0.10"
-futures = "0.3.28"
+async-std = "1.13"
+async-tls = { git = "https://github.com/j4r0u53k/async-tls.git", branch = "update-rustls-0-23", version = "0.14" }
+async-tungstenite = "0.28"
+ws_stream_tungstenite = "0.14"
+futures = "0.3.31"
 structopt = "0.3.26"
-rustls-pemfile = "1.0"
-rustls = "0.20.6"
-log = "0.4.19"
-env_logger ="0.10"
+rustls-pemfile = "2.2"
+rustls = "0.23"
+log = "0.4"
+env_logger ="0.11"
