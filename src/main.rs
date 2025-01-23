@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::fmt::{Debug, Display};
-use std::io::{BufReader, Seek};
+use std::io::BufReader;
 use std::time::Duration;
 use std::sync::Arc;
 use async_std::task;
@@ -8,9 +8,9 @@ use async_std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use async_std::io::ErrorKind;
 use async_std::path::{Path, PathBuf};
 use futures::{AsyncReadExt, AsyncRead, AsyncWrite, StreamExt};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use structopt::StructOpt;
-use rustls_pemfile;
-use rustls::{Certificate, PrivateKey, ServerConfig, ClientConfig};
+use rustls::{ServerConfig, ClientConfig};
 use log::*;
 
 #[derive(Debug, StructOpt)]
@@ -64,38 +64,32 @@ impl<T> AsyncRW for T where T: AsyncRead + AsyncWrite {}
 
 type AsyncRWBox = Box<dyn AsyncRW + Unpin + Send>;
 
-fn load_certs(certs_file: &Path) -> Result<Vec<Certificate>, std::io::Error> {
+fn load_certs<'b>(certs_file: &Path) -> Result<Vec<CertificateDer<'b>>, std::io::Error> {
     let mut reader = BufReader::new(File::open(certs_file)?);
-
-    rustls_pemfile::certs(&mut reader)
-        .map(|certs|
-            certs.into_iter().map(|vec| Certificate(vec)).collect())
+    rustls_pemfile::certs(&mut reader).collect()
 }
 
-fn load_keys(key_file: &Path) -> Result<Vec<PrivateKey>, std::io::Error> {
-    let mut reader = BufReader::new(File::open(key_file)?);
+fn load_keys<'b>(key_file: &Path) -> Result<Vec<PrivateKeyDer<'b>>, std::io::Error> {
+    let keys: Vec<PrivateKeyDer> = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(File::open(key_file)?))
+        .map(|key|
+            key.map(PrivateKeyDer::Pkcs8)
+        )
+        .collect::<Result<Vec<_>,_>>()?;
 
-    let keys: Vec<PrivateKey> = rustls_pemfile::pkcs8_private_keys(&mut reader)
-        .map(|keys|
-            keys.into_iter()
-                .map(|key| PrivateKey(key))
-                .collect())?;
-
-    if keys.len() > 0 {
+    if !keys.is_empty() {
         Ok(keys)
     } else {
         // If no keys in PKCS#8 format were found, try it once again for PKCS#1 format
-        reader.rewind()?;
-        rustls_pemfile::rsa_private_keys(&mut reader)
-            .map(|keys|
-                keys.into_iter()
-                    .map(|key| PrivateKey(key))
-                    .collect())
+        rustls_pemfile::rsa_private_keys(&mut BufReader::new(File::open(key_file)?))
+        .map(|key|
+            key.map(PrivateKeyDer::Pkcs1)
+        )
+        .collect::<Result<Vec<_>,_>>()
     }
 }
 
 fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Error> {
-    let mut certs: Vec<Certificate> = Vec::new();
+    let mut certs: Vec<CertificateDer> = Vec::new();
     if let Some(ref cert_files) = options.server_certs {
         for file in cert_files {
             certs.append(&mut load_certs(file)
@@ -106,7 +100,7 @@ fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Err
         }
     }
 
-    let keys = load_keys(&options.server_key
+    let mut keys = load_keys(&options.server_key
         .clone()
         .ok_or_else(|| {
             error!("No server key provided");
@@ -117,11 +111,11 @@ fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Err
     info!("Loaded {} certificates, {} keys", certs.len(), keys.len());
 
     let config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, keys.first()
-                          .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid private key"))?
-                          .clone())
+        .with_single_cert(
+            certs,
+            keys.pop().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid private key"))?
+        )
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
 
     Ok(config)
@@ -130,7 +124,7 @@ fn load_server_config(options: &CliOptions) -> Result<ServerConfig, std::io::Err
 fn load_server_options(cli_options: &CliOptions) -> Result<ServerOptions, std::io::Error> {
     Ok(ServerOptions {
         tls_config: if cli_options.server_tls {
-            Some(load_server_config(&cli_options)?)
+            Some(load_server_config(cli_options)?)
         } else {
             None
         },
@@ -139,7 +133,7 @@ fn load_server_options(cli_options: &CliOptions) -> Result<ServerOptions, std::i
 }
 
 fn load_target_options(cli_options: &CliOptions) -> Result<TargetOptions<String>, std::io::Error> {
-    let target_domain = cli_options.target_addr.split(':').nth(0)
+    let target_domain = cli_options.target_addr.split(':').next()
         .ok_or_else(|| {
             error!("Invalid target address format");
             std::io::Error::from(std::io::ErrorKind::InvalidInput)})?;
@@ -148,7 +142,7 @@ fn load_target_options(cli_options: &CliOptions) -> Result<TargetOptions<String>
         address: cli_options.target_addr.clone(),
         domain: target_domain.to_string(),
         tls_config: if cli_options.target_tls {
-            Some(load_client_config(&cli_options)?)
+            Some(load_client_config(cli_options)?)
         } else {
             None
         },
@@ -160,16 +154,16 @@ fn load_client_config(options: &CliOptions) -> Result<ClientConfig, std::io::Err
     let mut root_cert_store = rustls::RootCertStore::empty();
     if let Some(ca_certs) = &options.ca_certs {
         let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(ca_certs)?))
-            .or_else(|_| {
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
                 error!("Can't add root certificate");
-                Err(std::io::Error::from(ErrorKind::InvalidInput))
+                std::io::Error::from(ErrorKind::InvalidInput)
             })?;
-        let (added, ignored) = root_cert_store.add_parsable_certificates(&certs);
+        let (added, ignored) = root_cert_store.add_parsable_certificates(certs);
         info!("CA certificates added: {}, ignored: {}", added, ignored);
     };
 
     let mut config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
 
@@ -181,7 +175,7 @@ fn load_client_config(options: &CliOptions) -> Result<ClientConfig, std::io::Err
 async fn server_handshake(stream: TcpStream, options: Arc<ServerOptions>, timeout: &Duration) -> Result<AsyncRWBox, std::io::Error> {
     let peer_addr = stream.peer_addr()?;
 
-    let stream: AsyncRWBox = if let Some(ref config) = options.tls_config {
+    let stream: AsyncRWBox = if let Some(config) = &options.tls_config {
         info!("Establishing TLS server handshake with {} ...", &peer_addr);
 
         let tls_stream = async_std::io::timeout(*timeout, async {
@@ -227,7 +221,7 @@ async fn target_handshake<T, U>(options: Arc<TargetOptions<T>>, client_addr: &U,
     where T: ToSocketAddrs + Display,
           U: Display,
 {
-    let ref target_addr = options.address;
+    let target_addr = &options.address;
     info!("{} Connecting to the target ({}) ...", client_addr, target_addr);
 
     let target_stream = async_std::io::timeout(*timeout, async {
@@ -329,8 +323,8 @@ async fn run_proxy(listen_addr: String,
     Ok(())
 }
 
-const PROGRAM_NAME: &'static str = env!("CARGO_PKG_NAME");
-const PROGRAM_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const PROGRAM_NAME: &str = env!("CARGO_PKG_NAME");
+const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default()
